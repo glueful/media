@@ -1,0 +1,46 @@
+{
+    "name": "glueful/media",
+    "description": "Rich media processing for Glueful (image transforms, thumbnails, media metadata).",
+    "type": "glueful-extension",
+    "license": "MIT",
+    "authors": [{ "name": "Michael Tawiah Sowah", "email": "michael@glueful.dev" }],
+    "keywords": ["media", "image", "thumbnails", "metadata", "glueful"],
+    "require": {
+        "php": "^8.3",
+        "intervention/image": "^4.1",
+        "james-heinrich/getid3": "^1.9"
+    },
+    "require-dev": {
+        "glueful/framework": "^1.52.0",
+        "phpunit/phpunit": "^10.5",
+        "squizlabs/php_codesniffer": "^3.6",
+        "phpstan/phpstan": "^1.0"
+    },
+    "homepage": "https://github.com/glueful/media",
+    "autoload": {
+        "psr-4": { "Glueful\\Extensions\\Media\\": "src/" },
+        "files": ["helpers.php"]
+    },
+    "autoload-dev": {
+        "psr-4": { "Glueful\\Extensions\\Media\\Tests\\": "tests/" }
+    },
+    "scripts": {
+        "test": "vendor/bin/phpunit",
+        "phpcs": "vendor/bin/phpcs --standard=PSR12 src",
+        "phpcbf": "vendor/bin/phpcbf --standard=PSR12 src",
+        "analyze": "vendor/bin/phpstan analyse"
+    },
+    "extra": {
+        "glueful": {
+            "name": "Media",
+            "displayName": "Media",
+            "description": "Rich media processing for Glueful.",
+            "version": "1.0.0",
+            "categories": ["media", "images"],
+            "publisher": "glueful-team",
+            "provider": "Glueful\\Extensions\\Media\\MediaServiceProvider",
+            "requires": { "glueful": ">=1.52.0", "extensions": [] }
+        }
+    },
+    "config": { "sort-packages": true }
+}
