@@ -274,23 +274,19 @@ final class MediaInstalledTest extends TestCase
     }
 
     /**
-     * #5 image() helper — exists, and the EXTENSION's resolution path yields the
-     * fluent extension Contracts\ImageProcessorInterface for a real image.
+     * #5 image() global helper — defined by the EXTENSION and resolving the fluent
+     * extension Contracts\ImageProcessorInterface for a real image.
      *
      * The extension's helpers.php defines image() as:
      *   app($context, Contracts\ImageProcessorInterface::class)::make($source)
-     * This test exercises that exact resolution path directly so it proves the
-     * D1–D3 image graph is correct and the fluent contract holds.
      *
-     * KNOWN GAP (framework-side, out of this extension's scope): the framework's
-     * src/helpers.php still defines a stale global image() returning the now-unbound
-     * \Glueful\Services\ImageProcessorInterface, and its helpers.php autoloads BEFORE
-     * this extension's (composer files order), so its function_exists() guard wins —
-     * the extension's image() never registers and the global image() throws
-     * NotFoundException when media is installed. This test pins both facts: the
-     * extension graph is correct, and the global helper is currently shadowed.
-     * Fixing it requires deleting the framework's stale image() helper (and the
-     * dead Services\ImageProcessorInterface / ImageProvider) in the framework repo.
+     * As of media C1 the framework's core src/helpers.php no longer defines a global
+     * image() (the stale helper + the dead Services\ImageProcessorInterface /
+     * ImageProvider were deleted from the framework, and intervention/image moved
+     * here). With core's shadow removed, the extension's image() registers and is the
+     * ONE active global helper — so calling image($context, $source) directly now
+     * returns the extension's fluent processor. This test asserts that positive
+     * behaviour end-to-end (the earlier "known gap" characterisation is obsolete).
      */
     public function testImageHelperReturnsFluentProcessor(): void
     {
@@ -298,35 +294,26 @@ final class MediaInstalledTest extends TestCase
 
         $fixture = $this->makeJpegFixture(120, 90);
 
-        // Exercise the EXTENSION's intended resolution path (what its helpers.php
-        // image() does internally): resolve the extension contract from the booted
-        // container and make() a real image. This proves the D1–D3 graph yields the
-        // correct fluent processor.
-        $resolver = app($this->context, MediaImageProcessorInterface::class);
-        $processor = $resolver::make($fixture);
+        // The active global image() is now the EXTENSION's (core no longer shadows
+        // it). Its return type is the extension's fluent contract.
+        $active = new \ReflectionFunction('image');
+        self::assertSame(
+            MediaImageProcessorInterface::class,
+            (string) $active->getReturnType(),
+            'The active global image() must be the extension helper returning its fluent contract '
+            . '(core no longer defines image()).'
+        );
+
+        // Calling the global helper directly resolves the extension's fluent
+        // processor for a real image — proving the D1–D3 graph + helper wiring.
+        $processor = image($this->context, $fixture);
 
         self::assertInstanceOf(
             MediaImageProcessorInterface::class,
             $processor,
-            'The extension image graph must yield the fluent ImageProcessorInterface.'
+            'The global image() helper must yield the fluent ImageProcessorInterface.'
         );
         self::assertInstanceOf(ImageProcessor::class, $processor);
-
-        // Characterise the KNOWN GAP: the active global image() is the framework's
-        // stale one, which resolves the unbound \Glueful\Services\ImageProcessorInterface.
-        $active = new \ReflectionFunction('image');
-        self::assertSame(
-            'Glueful\\Services\\ImageProcessorInterface',
-            (string) $active->getReturnType(),
-            'GAP: the active global image() is the framework stale helper, not the extension one '
-            . '(framework helpers.php autoloads first; fix belongs in the framework).'
-        );
-        try {
-            image($this->context, $fixture);
-            self::fail('Expected the stale global image() to throw for the unbound core interface.');
-        } catch (\Glueful\Container\Exception\NotFoundException $e) {
-            self::assertStringContainsString('Glueful\\Services\\ImageProcessorInterface', $e->getMessage());
-        }
 
         @unlink($fixture);
     }
