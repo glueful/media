@@ -35,9 +35,13 @@ use Psr\Log\LoggerInterface;
 final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
 {
     /**
+     * Strongly-typed service definitions. Must be `defs()` (not the DSL `services()`):
+     * the framework's extension loader passes `defs()` entries through as DefinitionInterface
+     * objects, whereas `services()` is compiled by the DSL loader which only accepts array specs.
+     *
      * @return array<string, DefinitionInterface>
      */
-    public static function services(): array
+    public static function defs(): array
     {
         return [
             // Intervention ImageManager with driver selection.
