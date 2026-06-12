@@ -6,6 +6,16 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Documentation
+
+- **README and ImageProcessorIntegration aligned with actual behavior.** Corrected the HTTP
+  output method (`stream()`, not the nonexistent `toResponse()`); documented `cached()`'s
+  read-or-populate + tag-invalidation semantics and the auto-key collision caveat; added the
+  `formats`/`security`/`metadata`/`watermark` env vars (marking `IMAGE_PNG_COMPRESSION` inert and
+  `IMAGE_MAX_MEMORY`/`IMAGE_PROCESSING_TIMEOUT` reserved/not yet enforced); documented the
+  fail-closed remote-fetch, SSRF, watermark, and getID3 hardening; raised the documented
+  framework requirement to >=1.55.0.
+
 ### Added
 
 - **Discovery-path regression test.** Loads the provider through the framework's real
