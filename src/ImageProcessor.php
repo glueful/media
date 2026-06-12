@@ -101,6 +101,8 @@ class ImageProcessor implements ImageProcessorInterface
                 'defaults' => $getConfig('image.defaults'),
                 'performance' => $getConfig('image.performance'),
                 'monitoring' => $getConfig('image.monitoring'),
+                // Per-format encoder settings (progressive JPEG, lossless WebP) read by getEncoder().
+                'formats' => $getConfig('image.formats'),
                 // Needed so watermark() can confine the local watermark source to paths.watermark_dir.
                 'paths' => $getConfig('image.paths'),
             ],
@@ -722,10 +724,63 @@ class ImageProcessor implements ImageProcessorInterface
         }
     }
 
+    /**
+     * Read-or-populate the rendered image through the framework cache.
+     *
+     * On a cache HIT the stored payload (image bytes + format/dimension hints) is decoded back
+     * into {@see $image} and the just-decoded form is adopted as the current image — so a
+     * subsequent {@see getImageData()} returns the cached bytes WITHOUT re-running the encoder.
+     * On a MISS the current image is encoded once, stored (with the configured tags, when the
+     * backend supports tagging), and kept as-is.
+     *
+     * This replaces the former write-only behaviour where every "cached" pipeline re-encoded and
+     * filled a cache that nothing ever read.
+     *
+     * Caching is best-effort: any backend failure (get OR set) is logged and swallowed so the
+     * pipeline degrades to a normal in-memory render rather than throwing.
+     *
+     * CALLER NOTE on key collisions: an auto-generated key (see {@see generateCacheKey()}) hashes
+     * the queued operations, the current quality/format and the CURRENT dimensions — it does NOT
+     * fingerprint the source image bytes (doing so would force an extra encode). Two different
+     * source images that happen to share identical dimensions and the identical operation chain
+     * would therefore collide on an auto key. When that ambiguity matters, pass an EXPLICIT $key
+     * that identifies the source (e.g. the upload UUID or a content hash you already hold).
+     *
+     * @param string|null $key Explicit cache key, or null to derive one from the pipeline state.
+     *                         Explicit keys containing characters outside [A-Za-z0-9_.-] are
+     *                         hashed before use to neutralise backend delimiter-injection
+     *                         (Memcached spaces/newlines) and file-cache path-traversal.
+     * @param int $ttl Time to live in seconds.
+     */
     public function cached(?string $key = null, int $ttl = 3600): self
     {
-        $this->cacheKey = $key ?? $this->generateCacheKey();
+        $this->cacheKey = $key !== null ? $this->sanitizeCacheKey($key) : $this->generateCacheKey();
+        $fullCacheKey = ($this->config['cache']['prefix'] ?? 'image_') . $this->cacheKey;
 
+        // 1) Read: on a hit, adopt the cached bytes and skip re-encoding entirely.
+        try {
+            $cached = $this->cache->get($fullCacheKey);
+            if (is_array($cached) && isset($cached['image_data']) && is_string($cached['image_data'])) {
+                $this->image = $this->manager->decode($cached['image_data']);
+
+                $this->logger->debug('Image cache hit', [
+                    'cache_key' => $this->cacheKey,
+                    'size' => strlen($cached['image_data']),
+                ]);
+
+                return $this;
+            }
+        } catch (\Throwable $e) {
+            // A read failure must not abort the pipeline; fall through to a normal render.
+            $this->logger->warning('Cache read failed', [
+                'error' => $e->getMessage(),
+                'cache_key' => $this->cacheKey,
+            ]);
+
+            return $this;
+        }
+
+        // 2) Miss: encode once, persist (with tags when supported), keep the current image.
         try {
             $cacheData = [
                 'image_data' => $this->getImageData(),
@@ -736,9 +791,19 @@ class ImageProcessor implements ImageProcessorInterface
                 'created_at' => time()
             ];
 
-            $fullCacheKey = ($this->config['cache']['prefix'] ?? 'image_') . $this->cacheKey;
-
             $this->cache->set($fullCacheKey, $cacheData, $ttl);
+
+            // Associate the configured tags so the entries can be invalidated as a group. The
+            // CacheStore contract exposes addTags(); drivers that cannot tag (e.g. plain file)
+            // are expected to no-op rather than throw, but we guard anyway.
+            /** @var list<string> $tags */
+            $tags = array_values(array_filter(
+                (array) ($this->config['cache']['tags'] ?? []),
+                static fn($t): bool => is_string($t) && $t !== ''
+            ));
+            if ($tags !== []) {
+                $this->cache->addTags($fullCacheKey, $tags);
+            }
 
             $this->logger->debug('Image cached', [
                 'cache_key' => $this->cacheKey,
@@ -747,7 +812,7 @@ class ImageProcessor implements ImageProcessorInterface
             ]);
 
             return $this;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $this->logger->warning('Cache save failed', [
                 'error' => $e->getMessage(),
                 'cache_key' => $this->cacheKey
@@ -756,6 +821,23 @@ class ImageProcessor implements ImageProcessorInterface
             // Don't throw - caching is optional
             return $this;
         }
+    }
+
+    /**
+     * Neutralise a caller-supplied cache key. The key is concatenated raw onto the configured
+     * prefix and handed to the cache backend, so an unsanitised value is a backend delimiter
+     * injection (Memcached treats spaces/newlines as protocol delimiters) and a file-cache path
+     * traversal class. Any key containing a character outside the safe set [A-Za-z0-9_.-] is
+     * replaced wholesale with a short sha256 of the original (collision-resistant and confined to
+     * the safe alphabet). Already-safe keys are returned unchanged.
+     */
+    private function sanitizeCacheKey(string $key): string
+    {
+        if (preg_match('/^[A-Za-z0-9_.\-]+$/', $key) === 1) {
+            return $key;
+        }
+
+        return substr(hash('sha256', $key), 0, 32);
     }
 
     public function toBase64(?string $format = null): string
@@ -1020,6 +1102,14 @@ class ImageProcessor implements ImageProcessorInterface
         };
     }
 
+    /**
+     * Derive a cache key from the pipeline's identifying state: the queued operations, the current
+     * quality/format and the current dimensions. NOTE: this deliberately does NOT hash the source
+     * image bytes (that would require an extra encode), so two distinct sources with identical
+     * dimensions + operations collide on this key — pass an explicit key to {@see cached()} when
+     * that matters (see that method's docblock). The output is hex-only and thus already inside the
+     * cache-safe alphabet, so it never needs sanitising.
+     */
     private function generateCacheKey(): string
     {
         $data = [
@@ -1074,7 +1164,21 @@ class ImageProcessor implements ImageProcessorInterface
     }
 
     /**
-     * Get appropriate encoder for format and quality
+     * Build the Intervention encoder for a format, honouring the documented `formats.*` config.
+     *
+     * Wired through to the v4 encoder constructors (verified against intervention/image v4):
+     *  - JPEG: `formats.jpeg.progressive` (IMAGE_JPEG_PROGRESSIVE) -> JpegEncoder::$progressive,
+     *    which the GD encoder maps to imageinterlace().
+     *  - WebP: `formats.webp.lossless` (IMAGE_WEBP_LOSSLESS). The v4 WebpEncoder has NO `lossless`
+     *    constructor parameter; its GD encoder instead emits lossless WebP only when quality === 100
+     *    (it then substitutes IMG_WEBP_LOSSLESS). So lossless is requested by forcing quality to 100
+     *    — the single supported lossless path in this driver.
+     *
+     * NOT wireable in intervention/image v4 (documented here so the gap is explicit, not silently
+     * dropped): the PNG zlib compression level (config `optimization.png_compression` /
+     * `formats.png.compression`, env IMAGE_PNG_COMPRESSION) has no encoder constructor parameter —
+     * the v4 GD PngEncoder hardcodes imagepng(..., -1) (zlib default). The config key is therefore
+     * inert for PNG output until the upstream encoder grows a compression option.
      *
      * @param string $format Image format
      * @param int $quality Quality setting
@@ -1082,11 +1186,20 @@ class ImageProcessor implements ImageProcessorInterface
      */
     private function getEncoder(string $format, int $quality): \Intervention\Image\Interfaces\EncoderInterface
     {
+        /** @var array<string, mixed> $formats */
+        $formats = (array) ($this->config['formats'] ?? []);
+
         return match (strtolower($format)) {
-            'jpg', 'jpeg' => new JpegEncoder(quality: $quality),
+            'jpg', 'jpeg' => new JpegEncoder(
+                quality: $quality,
+                progressive: (bool) (($formats['jpeg']['progressive'] ?? false)),
+            ),
             'png' => new PngEncoder(),
             'gif' => new GifEncoder(),
-            'webp' => new WebpEncoder(quality: $quality),
+            'webp' => new WebpEncoder(
+                // Lossless WebP in the v4 GD driver is keyed off quality === 100.
+                quality: (bool) (($formats['webp']['lossless'] ?? false)) ? 100 : $quality,
+            ),
             default => new AutoEncoder(quality: $quality)
         };
     }

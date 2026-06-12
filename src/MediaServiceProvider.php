@@ -99,6 +99,11 @@ final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
                         'defaults' => $getConfig('image.defaults'),
                         'performance' => $getConfig('image.performance'),
                         'monitoring' => $getConfig('image.monitoring'),
+                        // Per-format encoder settings (progressive JPEG, lossless WebP) read by
+                        // getEncoder(); must mirror fresh() so DI and factory paths agree.
+                        'formats' => $getConfig('image.formats'),
+                        // Watermark dir confinement parity with fresh().
+                        'paths' => $getConfig('image.paths'),
                     ];
 
                     return new ImageProcessor(

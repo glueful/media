@@ -58,6 +58,18 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- **`cached()` actually caches now.** It was write-only — every "cached" pipeline re-decoded and
+  re-encoded while filling entries nothing ever read. It now reads first and, on a hit, restores
+  the cached image without re-encoding; caller-supplied keys with unsafe characters are hashed
+  (closing Memcached delimiter-injection / file-cache traversal via raw keys), and the configured
+  `cache.tags` are associated via the CacheStore tag API so grouped invalidation works. Note:
+  auto-generated keys hash operations + dimensions but not source bytes — pass an explicit key
+  when two sources could share both.
+- **Per-format encoder config takes effect.** `IMAGE_JPEG_PROGRESSIVE` (progressive JPEG) and
+  `IMAGE_WEBP_LOSSLESS` (expressed as quality 100 — Intervention v4's only lossless WebP path)
+  were documented but ignored by the encoder; they're now wired through both the factory and DI
+  config paths. `IMAGE_PNG_COMPRESSION` remains inert — Intervention v4's PNG encoder has no
+  compression parameter — and is now documented as such instead of silently dropped.
 - **ImageProcessor factories no longer share one mutated instance.** `make()`/`fromUrl()`/
   `fromUpload()`/`create()` all resolved the container's shared singleton, swapped its image
   state, and returned it — process two images in one request and the first reference silently
