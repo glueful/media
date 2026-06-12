@@ -101,6 +101,8 @@ class ImageProcessor implements ImageProcessorInterface
                 'defaults' => $getConfig('image.defaults'),
                 'performance' => $getConfig('image.performance'),
                 'monitoring' => $getConfig('image.monitoring'),
+                // Needed so watermark() can confine the local watermark source to paths.watermark_dir.
+                'paths' => $getConfig('image.paths'),
             ],
         );
     }
@@ -479,9 +481,14 @@ class ImageProcessor implements ImageProcessorInterface
             );
         }
 
-        // Validate file size. PSR-7 getSize() may return null (size unknown); treat that as 0 so
-        // the validator still runs against an int (fresh()'s precise typing now surfaces this).
-        $instance->security->validateFileSize($file->getSize() ?? 0);
+        // Validate file size. PSR-7 getSize(): ?int may return null (size unknown — e.g. a
+        // non-seekable stream). When it does, SKIP the size cap rather than coerce null to 0: a
+        // 0-byte "size" would silently pass the cap and assert a falsehood about the upload. The
+        // decode-time dimension/integrity checks in validateImage() still bound the real payload.
+        $size = $file->getSize();
+        if ($size !== null) {
+            $instance->security->validateFileSize($size);
+        }
 
         // Validate format
         $filename = $file->getClientFilename() ?? 'upload';
@@ -659,10 +666,15 @@ class ImageProcessor implements ImageProcessorInterface
             );
         }
 
+        // Confine the watermark source to a trusted base BEFORE the manager reads it: an
+        // unvalidated path (or stream-wrapper string) handed to decode() is an arbitrary-file-read
+        // primitive (e.g. /etc/passwd, php://filter, http://internal).
+        $resolvedWatermark = $this->resolveWatermarkPath($watermarkPath);
+
         $this->operations[] = ['watermark', compact('watermarkPath', 'position', 'opacity')];
 
         try {
-            $watermark = $this->manager->decode($watermarkPath);
+            $watermark = $this->manager->decode($resolvedWatermark);
 
             // Apply opacity
             if ($opacity < 100) {
@@ -934,6 +946,55 @@ class ImageProcessor implements ImageProcessorInterface
     }
 
     /**
+     * Resolve and confine a watermark source to a trusted local directory.
+     *
+     * The raw $watermarkPath reaches the image manager's decode(), which reads any path or PHP
+     * stream-wrapper string it is given — so an unconfined value is an arbitrary-file-read /SSRF
+     * primitive (`/etc/passwd`, `php://filter/...`, `http://169.254.169.254/...`). This rejects
+     * URLs and stream wrappers outright, then requires the canonical realpath() to exist AND sit
+     * inside the configured watermark base (paths.watermark_dir, defaulting to the system temp dir
+     * when unset). The returned path is the validated realpath.
+     *
+     * @throws BusinessLogicException If the path is a URL/stream wrapper, missing, or escapes the base.
+     */
+    private function resolveWatermarkPath(string $watermarkPath): string
+    {
+        // Reject any scheme-prefixed value (http://, https://, php://, file://, data://, ...). A bare
+        // local path has no "://" wrapper separator.
+        if (preg_match('#^[a-zA-Z][a-zA-Z0-9+.\-]*://#', $watermarkPath) === 1) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Watermark path must be a local file, not a URL or stream wrapper'
+            );
+        }
+
+        $baseConfigured = (string) ($this->config['paths']['watermark_dir'] ?? '');
+        $base = $baseConfigured !== '' ? $baseConfigured : sys_get_temp_dir();
+
+        $realBase = realpath($base);
+        $realPath = realpath($watermarkPath);
+
+        if ($realBase === false || $realPath === false) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Watermark file does not exist'
+            );
+        }
+
+        // Prefix-match with a trailing separator so "/base/watermarks" cannot be satisfied by a
+        // sibling like "/base/watermarks-evil/x.png".
+        $realBaseWithSep = rtrim($realBase, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        if (!str_starts_with($realPath . DIRECTORY_SEPARATOR, $realBaseWithSep)) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Watermark path is outside the allowed watermark directory'
+            );
+        }
+
+        return $realPath;
+    }
+
+    /**
      * @return array{x: int, y: int}
      */
     private function calculateWatermarkPosition(string $position, ImageInterface $watermark): array
@@ -948,9 +1009,12 @@ class ImageProcessor implements ImageProcessorInterface
             'top-right' => ['x' => $imageWidth - $watermarkWidth - 10, 'y' => 10],
             'bottom-left' => ['x' => 10, 'y' => $imageHeight - $watermarkHeight - 10],
             'bottom-right' => ['x' => $imageWidth - $watermarkWidth - 10, 'y' => $imageHeight - $watermarkHeight - 10],
+            // PHP's `/` always yields a float, so an odd width/height difference would hand a float
+            // to insert()'s `int $x`/`int $y` and throw a TypeError under strict_types. Round to the
+            // nearest whole pixel and cast back to int.
             'center' => [
-                'x' => ($imageWidth - $watermarkWidth) / 2,
-                'y' => ($imageHeight - $watermarkHeight) / 2
+                'x' => (int) round(($imageWidth - $watermarkWidth) / 2),
+                'y' => (int) round(($imageHeight - $watermarkHeight) / 2)
             ],
             default => ['x' => $imageWidth - $watermarkWidth - 10, 'y' => $imageHeight - $watermarkHeight - 10]
         };

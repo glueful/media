@@ -39,6 +39,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   Covered by `RemoteFetchSafetyTest` (IP classification incl. decimal/hex/octal literals,
   redirect resolution, option forcing, size caps, and the `make()` routing). Note: the core
   `ImageSecurityValidator`'s fail-open defaults remain a separate cross-repo hardening item.
+- **Watermark sources are confined to the configured directory.** `watermark()` handed its path
+  straight to the decoder, which reads any local path or stream-wrapper string
+  (`/etc/passwd`, `php://filter/...`, `http://...`) — an arbitrary-file-read/SSRF vector.
+  Watermark paths now reject URL/stream schemes outright and must canonicalize (realpath) inside
+  `paths.watermark_dir`, with sibling-prefix-safe matching. Also fixed: centering a watermark
+  with an odd dimension difference threw a `TypeError` (float coords into int parameters), and
+  unknown-size uploads (PSR-7 `getSize(): null`) now skip the file-size cap instead of asserting
+  a 0-byte size — decode-time dimension/integrity checks still apply.
 - **getID3 analysis is capped and contained.** Media metadata extraction passed uploads straight
   to `getID3::analyze()` — a pure-PHP container parser with a history of vulnerabilities on
   malformed input — with no size cap and no warning containment. Files are now size-capped before
