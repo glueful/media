@@ -50,6 +50,13 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- **ImageProcessor factories no longer share one mutated instance.** `make()`/`fromUrl()`/
+  `fromUpload()`/`create()` all resolved the container's shared singleton, swapped its image
+  state, and returned it — process two images in one request and the first reference silently
+  pointed at the second image's bytes; under persistent workers (RoadRunner/Swoole) state bled
+  across requests. Each factory call (and each `ImageProcessorInterface` container resolution —
+  the binding is now non-shared) yields a fresh processor. The `image()` helper also forwards its
+  explicit `$context` argument instead of discarding it in favor of the static default.
 - **Boot compatibility with framework 1.55 — framework pin raised to `^1.55.0`.** The service
   provider declared its bindings via the DSL `services()` method but returned strongly-typed
   `DefinitionInterface` objects, which the framework's DSL service loader rejects

@@ -93,21 +93,30 @@ final class MediaServiceProviderTest extends TestCase
         );
     }
 
-    public function testImageProcessorInterfaceAndConcreteShareOneInstance(): void
+    public function testImageProcessorInterfaceResolvesFreshPerCall(): void
     {
         $context = $this->context();
         $container = $this->container($context, new ImageSecurityValidator([]));
 
-        $viaInterface = $container->get(ImageProcessorInterface::class);
+        $first = $container->get(ImageProcessorInterface::class);
+        $second = $container->get(ImageProcessorInterface::class);
         $viaConcrete = $container->get(ImageProcessor::class);
 
-        self::assertInstanceOf(ImageProcessor::class, $viaInterface);
-        // make() resolves the CONCRETE id (app($context, ImageProcessor::class));
-        // the alias must funnel it to the same shared interface instance.
-        self::assertSame(
-            $viaInterface,
+        self::assertInstanceOf(ImageProcessor::class, $first);
+        self::assertInstanceOf(ImageProcessor::class, $viaConcrete);
+
+        // The binding is NON-shared: ImageProcessor carries mutable per-image state, so a shared
+        // instance would let two consumers processing different images stomp each other. Every
+        // resolution — interface OR concrete-alias — must therefore be a distinct instance.
+        self::assertNotSame(
+            $first,
+            $second,
+            'ImageProcessorInterface must resolve a fresh instance per call (non-shared)'
+        );
+        self::assertNotSame(
+            $first,
             $viaConcrete,
-            'ImageProcessor alias + shared interface factory must yield one shared instance'
+            'The concrete alias must also resolve fresh (AliasDefinition delegates to a non-shared target)'
         );
     }
 

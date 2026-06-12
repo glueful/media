@@ -69,9 +69,45 @@ class ImageProcessor implements ImageProcessorInterface
         self::$defaultContext = $context;
     }
 
+    /**
+     * Build a FRESH ImageProcessor from the container's collaborators.
+     *
+     * Every static factory routes through this so each call returns its own instance: the
+     * mutable per-image state (image, operations, cacheKey, current_*) starts clean by
+     * construction. Resolving the concrete id directly would hand back the same instance on a
+     * shared binding and let two images processed in one request — or, under persistent workers,
+     * across requests — stomp each other's bytes. The collaborators ARE resolved from the
+     * container (so the CORE-owned ImageManager/cache.store/validator/logger are reused), and the
+     * config array is assembled exactly as {@see MediaServiceProvider::defs()}'s factory closure
+     * does, keeping behaviour identical to a direct container resolution.
+     */
+    private static function fresh(ApplicationContext $context): self
+    {
+        $getConfig = static fn(string $key): array => \function_exists('config')
+            ? (array) config($context, $key, [])
+            : [];
+
+        return new self(
+            app($context, ImageManager::class),
+            app($context, 'cache.store'),
+            // CORE-owned validator (StorageProvider) — resolved, never re-bound here.
+            app($context, ImageSecurityValidator::class),
+            app($context, LoggerInterface::class),
+            [
+                'optimization' => $getConfig('image.optimization'),
+                'security' => $getConfig('image.security'),
+                'cache' => $getConfig('image.cache'),
+                'features' => $getConfig('image.features'),
+                'defaults' => $getConfig('image.defaults'),
+                'performance' => $getConfig('image.performance'),
+                'monitoring' => $getConfig('image.monitoring'),
+            ],
+        );
+    }
+
     public static function make(string $source, ?ApplicationContext $context = null): self
     {
-        $instance = app(self::resolveContext($context), self::class);
+        $instance = self::fresh(self::resolveContext($context));
 
         try {
             $instance->decodeSource($source);
@@ -117,7 +153,7 @@ class ImageProcessor implements ImageProcessorInterface
         array $options = [],
         ?ApplicationContext $context = null
     ): self {
-        $instance = app(self::resolveContext($context), self::class);
+        $instance = self::fresh(self::resolveContext($context));
 
         try {
             // Fetch with per-hop URL-policy + resolved-IP validation (SSRF defense), then decode.
@@ -434,7 +470,7 @@ class ImageProcessor implements ImageProcessorInterface
 
     public static function fromUpload(UploadedFileInterface $file, ?ApplicationContext $context = null): self
     {
-        $instance = app(self::resolveContext($context), self::class);
+        $instance = self::fresh(self::resolveContext($context));
 
         if ($file->getError() !== UPLOAD_ERR_OK) {
             throw BusinessLogicException::operationNotAllowed(
@@ -443,8 +479,9 @@ class ImageProcessor implements ImageProcessorInterface
             );
         }
 
-        // Validate file size
-        $instance->security->validateFileSize($file->getSize());
+        // Validate file size. PSR-7 getSize() may return null (size unknown); treat that as 0 so
+        // the validator still runs against an int (fresh()'s precise typing now surfaces this).
+        $instance->security->validateFileSize($file->getSize() ?? 0);
 
         // Validate format
         $filename = $file->getClientFilename() ?? 'upload';
@@ -470,7 +507,7 @@ class ImageProcessor implements ImageProcessorInterface
         string $background = 'ffffff',
         ?ApplicationContext $context = null
     ): self {
-        $instance = app(self::resolveContext($context), self::class);
+        $instance = self::fresh(self::resolveContext($context));
 
         // Validate dimensions
         $instance->security->validateDimensions($width, $height);

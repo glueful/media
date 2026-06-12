@@ -79,6 +79,11 @@ final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
 
             // Image processor interface — resolves the CORE-owned
             // ImageSecurityValidator and `cache.store`/logger.
+            //
+            // NON-shared (third arg false): ImageProcessor carries mutable per-image state
+            // (image bytes, operations, cacheKey), so a shared instance would let two injection
+            // points processing different images stomp each other — the same hazard the static
+            // factories avoid via fresh(). Every resolution therefore returns a clean instance.
             ImageProcessorInterface::class => new FactoryDefinition(
                 ImageProcessorInterface::class,
                 static function (ContainerInterface $c): ImageProcessor {
@@ -105,12 +110,12 @@ final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
                         $config,
                     );
                 },
-                true,
+                false,
             ),
 
-            // Concrete id aliases the interface so ImageProcessor::make()'s
-            // app($context, ImageProcessor::class) and direct interface lookups
-            // resolve to the SAME shared instance.
+            // Concrete id aliases the interface. AliasDefinition is itself non-shared and
+            // delegates to the target, so resolving ImageProcessor::class yields a FRESH
+            // instance per call too (matching the non-shared interface binding above).
             ImageProcessor::class => new AliasDefinition(
                 ImageProcessor::class,
                 ImageProcessorInterface::class,
