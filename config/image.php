@@ -227,4 +227,21 @@ return [
         'benchmark_operations' => env('IMAGE_BENCHMARK', false),
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Media Metadata Extraction
+    |--------------------------------------------------------------------------
+    |
+    | Settings for video/audio metadata extraction via getID3. getID3 is a
+    | pure-PHP container parser with a history of parser vulnerabilities on
+    | malformed input, so uploads are size-capped before they are analysed.
+    |
+    | max_filesize is an ABUSE GUARD, not a typical-use limit: media files are
+    | legitimately large, so the default is generous. Files larger than this are
+    | not handed to the parser and degrade to type-only metadata.
+    |
+    */
+    'metadata' => [
+        'max_filesize' => env('MEDIA_METADATA_MAX_FILESIZE', '500M'),
+    ],
 ];

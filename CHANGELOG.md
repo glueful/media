@@ -39,6 +39,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   Covered by `RemoteFetchSafetyTest` (IP classification incl. decimal/hex/octal literals,
   redirect resolution, option forcing, size caps, and the `make()` routing). Note: the core
   `ImageSecurityValidator`'s fail-open defaults remain a separate cross-repo hardening item.
+- **getID3 analysis is capped and contained.** Media metadata extraction passed uploads straight
+  to `getID3::analyze()` — a pure-PHP container parser with a history of vulnerabilities on
+  malformed input — with no size cap and no warning containment. Files are now size-capped before
+  analysis (`metadata.max_filesize`, env `MEDIA_METADATA_MAX_FILESIZE`, default `500M` — an abuse
+  guard, not a typical-use limit), the parser runs with warnings/Throwables contained, and
+  dimension/string values from container metadata are sanitized (control characters stripped,
+  length-capped). Oversized or malformed uploads degrade to type-only metadata instead of
+  exhausting a worker.
 
 ### Fixed
 
