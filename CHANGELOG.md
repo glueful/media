@@ -13,6 +13,33 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   guarding against typed `Definition` objects being returned from `services()` — a regression the
   existing `Container::load()`-based tests cannot catch.
 
+### Changed
+
+- **Remote image fetching is now opt-in (fail-closed defaults).** `config/image.php` defaults
+  `security.allowed_domains` to an empty list and `security.disable_external_urls` to `true`, so no
+  external host is fetched unless explicitly allow-listed via `IMAGE_ALLOWED_DOMAINS` (with
+  `IMAGE_DISABLE_EXTERNAL_URLS=false`). The previous defaults (`['*']` / `false`) were fail-open.
+
+### Security
+
+- **SSRF hardening for remote image fetching.** `ImageProcessor::fromUrl()` previously validated
+  only the initial URL and then let `file_get_contents` follow redirects, so an allow-listed or
+  open-redirect host could 302 to an internal address (e.g. cloud metadata `169.254.169.254`)
+  that was fetched unchecked; the URL blocklist was also substring-based and missed
+  encoded / IPv6 / link-local forms. Redirects are now followed manually with **every hop
+  re-validated**, and each target host is **resolved and rejected when it maps to a
+  private / loopback / link-local / reserved IP** (`isDisallowedIp`, replacing substring
+  blocklisting). Three review gaps in the original pass are closed too: the security-critical
+  stream-context options (`follow_location`/`max_redirects`/`ignore_errors`) are forced after the
+  caller-options merge so they can never be overridden; downloads are **size-capped** (new
+  `security.max_file_size`, env `IMAGE_REMOTE_MAX_FILESIZE`, default `10M`) via a length-capped
+  read plus a Content-Length pre-check, preventing unbounded buffering; and **`make()` — and
+  therefore the `image()` helper — now routes http(s) URLs through the same hardened per-hop
+  fetch** instead of a validate-once-then-decode flow that was open to DNS-rebinding TOCTOU.
+  Covered by `RemoteFetchSafetyTest` (IP classification incl. decimal/hex/octal literals,
+  redirect resolution, option forcing, size caps, and the `make()` routing). Note: the core
+  `ImageSecurityValidator`'s fail-open defaults remain a separate cross-repo hardening item.
+
 ### Fixed
 
 - **Boot compatibility with framework 1.55 — framework pin raised to `^1.55.0`.** The service
