@@ -69,17 +69,52 @@ class ImageProcessor implements ImageProcessorInterface
         self::$defaultContext = $context;
     }
 
+    /**
+     * Build a FRESH ImageProcessor from the container's collaborators.
+     *
+     * Every static factory routes through this so each call returns its own instance: the
+     * mutable per-image state (image, operations, cacheKey, current_*) starts clean by
+     * construction. Resolving the concrete id directly would hand back the same instance on a
+     * shared binding and let two images processed in one request — or, under persistent workers,
+     * across requests — stomp each other's bytes. The collaborators ARE resolved from the
+     * container (so the CORE-owned ImageManager/cache.store/validator/logger are reused), and the
+     * config array is assembled exactly as {@see MediaServiceProvider::defs()}'s factory closure
+     * does, keeping behaviour identical to a direct container resolution.
+     */
+    private static function fresh(ApplicationContext $context): self
+    {
+        $getConfig = static fn(string $key): array => \function_exists('config')
+            ? (array) config($context, $key, [])
+            : [];
+
+        return new self(
+            app($context, ImageManager::class),
+            app($context, 'cache.store'),
+            // CORE-owned validator (StorageProvider) — resolved, never re-bound here.
+            app($context, ImageSecurityValidator::class),
+            app($context, LoggerInterface::class),
+            [
+                'optimization' => $getConfig('image.optimization'),
+                'security' => $getConfig('image.security'),
+                'cache' => $getConfig('image.cache'),
+                'features' => $getConfig('image.features'),
+                'defaults' => $getConfig('image.defaults'),
+                'performance' => $getConfig('image.performance'),
+                'monitoring' => $getConfig('image.monitoring'),
+                // Per-format encoder settings (progressive JPEG, lossless WebP) read by getEncoder().
+                'formats' => $getConfig('image.formats'),
+                // Needed so watermark() can confine the local watermark source to paths.watermark_dir.
+                'paths' => $getConfig('image.paths'),
+            ],
+        );
+    }
+
     public static function make(string $source, ?ApplicationContext $context = null): self
     {
-        $instance = app(self::resolveContext($context), self::class);
+        $instance = self::fresh(self::resolveContext($context));
 
         try {
-            // Validate source security
-            if (filter_var($source, FILTER_VALIDATE_URL)) {
-                $instance->security->validateUrl($source);
-            }
-
-            $instance->image = $instance->manager->decode($source);
+            $instance->decodeSource($source);
             $instance->validateImage();
 
             $instance->logger->debug('Image loaded successfully', [
@@ -98,6 +133,23 @@ class ImageProcessor implements ImageProcessorInterface
     }
 
     /**
+     * Decode a make() source into the working image. http(s) URLs are routed through the SAME
+     * hardened fetch as fromUrl() so make() (and the image() helper) cannot be tricked into the
+     * resolve-at-validate, fetch-at-decode DNS-rebinding TOCTOU that handing the URL string to
+     * Intervention's decode() would allow. Non-URL sources (paths, data URIs, raw bytes) decode
+     * unchanged.
+     */
+    protected function decodeSource(string $source): void
+    {
+        if (filter_var($source, FILTER_VALIDATE_URL) !== false && self::isHttpUrl($source)) {
+            $this->image = $this->manager->decode($this->fetchRemoteImage($source, []));
+            return;
+        }
+
+        $this->image = $this->manager->decode($source);
+    }
+
+    /**
      * @param array<string, mixed> $options
      */
     public static function fromUrl(
@@ -105,26 +157,13 @@ class ImageProcessor implements ImageProcessorInterface
         array $options = [],
         ?ApplicationContext $context = null
     ): self {
-        $instance = app(self::resolveContext($context), self::class);
-        $instance->security->validateUrl($url);
+        $instance = self::fresh(self::resolveContext($context));
 
         try {
-            // Setup HTTP context for remote images
-            $context = stream_context_create([
-                'http' => array_merge([
-                    'timeout' => $instance->config['security']['timeout'] ?? 10,
-                    'user_agent' => $instance->config['security']['user_agent'] ?? 'Glueful-ImageProcessor/1.0',
-                    'follow_location' => true,
-                    'max_redirects' => 3,
-                ], $options)
-            ]);
-
-            // Intervention v4's decode() has no stream-context parameter, so fetch
-            // the remote image with the configured context first, then decode the bytes.
-            $contents = @file_get_contents($url, false, $context);
-            if ($contents === false) {
-                throw new \RuntimeException("Unable to fetch remote image: {$url}");
-            }
+            // Fetch with per-hop URL-policy + resolved-IP validation (SSRF defense), then decode.
+            // Intervention v4's decode() has no stream-context parameter, so the bytes are fetched
+            // here first.
+            $contents = $instance->fetchRemoteImage($url, $options);
             $instance->image = $instance->manager->decode($contents);
             $instance->validateImage();
 
@@ -143,9 +182,299 @@ class ImageProcessor implements ImageProcessorInterface
         }
     }
 
+    /**
+     * Fetch a remote image, following redirects MANUALLY so every hop is re-validated against the
+     * URL policy and a resolved-IP range check. file_get_contents' own follow_location is disabled
+     * because it would follow a redirect to an internal host (e.g. cloud metadata) unchecked.
+     *
+     * @param array<string, mixed> $options
+     */
+    protected function fetchRemoteImage(string $url, array $options): string
+    {
+        $maxRedirects = (int) ($this->config['security']['max_redirects'] ?? 3);
+        // Clamp to a sane positive cap; a misconfigured non-positive value would otherwise disable
+        // the length-capped read entirely.
+        $cap = max(1, self::parseSizeToBytes((string) ($this->config['security']['max_file_size'] ?? '10M')));
+
+        for ($hop = 0; $hop <= $maxRedirects; $hop++) {
+            // Policy gate (disable_external_urls + domain allow-list + core blocklist)...
+            $this->security->validateUrl($url);
+            // ...plus a self-sufficient resolved-IP check that rejects private/loopback/link-local
+            // /reserved targets the core substring blocklist misses (169.254.169.254, ::1, ...).
+            self::assertHostIsPublic($url);
+
+            $context = stream_context_create([
+                'http' => $this->buildStreamContextOptions($options),
+            ]);
+
+            // The HTTP stream wrapper populates $http_response_header in this scope; seed it so it
+            // is defined even when the request fails before any response is received.
+            $http_response_header = [];
+            // Cap the read at the byte limit + 1: file_get_contents' 5th parameter ($length) is the
+            // real guard here (PHP's http stream wrapper does NOT honor a 'max_length' context
+            // option), so an oversized body is truncated rather than fully buffered. The +1 lets the
+            // post-read length check below distinguish "exactly at cap" from "over cap".
+            $body = @file_get_contents($url, false, $context, 0, $cap + 1);
+            /** @var list<string> $responseHeaders */
+            $responseHeaders = $http_response_header;
+            $status = self::parseStatusCode($responseHeaders);
+
+            if ($status >= 300 && $status < 400) {
+                $location = self::parseLocationHeader($responseHeaders);
+                if ($location === null) {
+                    throw new \RuntimeException("Redirect without a Location header from: {$url}");
+                }
+                $url = self::resolveRedirectTarget($url, $location);
+                continue;
+            }
+
+            if ($body === false || $status < 200 || $status >= 300) {
+                throw new \RuntimeException("Unable to fetch remote image (HTTP {$status}): {$url}");
+            }
+
+            // Bail early when the server advertises a body larger than the cap, and enforce the cap
+            // against what was actually read (the length-capped read is the authoritative guard).
+            $advertised = self::parseContentLength($responseHeaders);
+            if ($advertised !== null && $advertised > $cap) {
+                throw new \RuntimeException(
+                    "Remote image exceeds the maximum allowed size of {$cap} bytes: {$url}"
+                );
+            }
+            if (strlen($body) > $cap) {
+                throw new \RuntimeException(
+                    "Remote image exceeds the maximum allowed size of {$cap} bytes: {$url}"
+                );
+            }
+
+            return $body;
+        }
+
+        throw new \RuntimeException("Too many redirects while fetching remote image: {$url}");
+    }
+
+    /**
+     * Build the `http` stream-context options for a remote fetch. Caller-supplied $options are
+     * merged FIRST, then the security-critical keys are forced unconditionally — they are NOT
+     * caller-configurable, so a malicious `$options` array cannot re-enable auto-follow (which
+     * would bypass the per-hop URL/IP validation) or swallow 3xx responses.
+     *
+     * @param array<string, mixed> $options
+     * @return array<string, mixed>
+     */
+    private function buildStreamContextOptions(array $options): array
+    {
+        return array_merge(
+            [
+                'timeout' => (int) ($this->config['security']['timeout'] ?? 10),
+                'user_agent' => $this->config['security']['user_agent'] ?? 'Glueful-ImageProcessor/1.0',
+            ],
+            $options,
+            [
+                // Forced last so caller $options can never override them.
+                'method' => 'GET',
+                'follow_location' => 0,  // never auto-follow; redirects are handled manually per hop
+                'max_redirects' => 1,
+                'ignore_errors' => true, // capture 3xx status/headers instead of failing the read
+            ],
+        );
+    }
+
+    /**
+     * Parse a size shorthand ('10M', '512K', '1G') or raw byte count to bytes. Mirrors the core
+     * ImageSecurityValidator's parser so the remote download cap and upload cap agree.
+     */
+    private static function parseSizeToBytes(string $size): int
+    {
+        $size = trim($size);
+        $unit = strtoupper(substr($size, -1));
+        $value = (int) substr($size, 0, -1);
+
+        return match ($unit) {
+            'G' => $value * 1024 * 1024 * 1024,
+            'M' => $value * 1024 * 1024,
+            'K' => $value * 1024,
+            default => (int) $size,
+        };
+    }
+
+    /**
+     * Whether a string is an http(s) URL (the only schemes routed through the hardened fetch).
+     */
+    private static function isHttpUrl(string $url): bool
+    {
+        $scheme = strtolower((string) (parse_url($url, PHP_URL_SCHEME) ?? ''));
+
+        return $scheme === 'http' || $scheme === 'https';
+    }
+
+    /**
+     * Reject a URL whose host resolves to a non-public address (SSRF defense).
+     */
+    private static function assertHostIsPublic(string $url): void
+    {
+        $host = parse_url($url, PHP_URL_HOST);
+        if (!is_string($host) || $host === '') {
+            throw new \RuntimeException('Remote image URL has no host');
+        }
+        $host = trim($host, '[]'); // strip IPv6 literal brackets
+
+        foreach (self::resolveHostIps($host) as $ip) {
+            if (self::isDisallowedIp($ip)) {
+                throw new \RuntimeException('Remote image host resolves to a disallowed address');
+            }
+        }
+    }
+
+    /**
+     * Resolve a host to all of its IP addresses (or the literal IP itself). Fails closed when a
+     * host cannot be resolved.
+     *
+     * @return list<string>
+     */
+    private static function resolveHostIps(string $host): array
+    {
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+            return [$host];
+        }
+
+        $v4 = gethostbynamel($host);
+        $ips = is_array($v4) ? $v4 : [];
+
+        $aaaa = @dns_get_record($host, DNS_AAAA);
+        if (is_array($aaaa)) {
+            foreach ($aaaa as $record) {
+                if (isset($record['ipv6']) && is_string($record['ipv6'])) {
+                    $ips[] = $record['ipv6'];
+                }
+            }
+        }
+
+        if ($ips === []) {
+            throw new \RuntimeException("Unable to resolve remote image host: {$host}");
+        }
+
+        return array_values($ips);
+    }
+
+    /**
+     * Whether an IP is in a private, loopback, link-local, or otherwise reserved range and must
+     * therefore NOT be fetched. Replaces substring blocklisting.
+     */
+    private static function isDisallowedIp(string $ip): bool
+    {
+        // Normalize an IPv4-mapped IPv6 address (::ffff:127.0.0.1) to its IPv4 form.
+        if (preg_match('#^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$#i', $ip, $m) === 1) {
+            $ip = $m[1];
+        }
+
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            return true; // not a valid IP -> reject
+        }
+
+        // Belt-and-suspenders for IPv6 loopback/link-local/ULA ranges the filter flags do not
+        // reliably cover across PHP versions.
+        $lower = strtolower($ip);
+        if (
+            $lower === '::1'
+            || str_starts_with($lower, 'fe80:')
+            || str_starts_with($lower, 'fc')
+            || str_starts_with($lower, 'fd')
+        ) {
+            return true;
+        }
+
+        // Reject private + reserved ranges (RFC1918, loopback 127/8, link-local 169.254/16,
+        // 0.0.0.0/8, and other reserved blocks).
+        return filter_var(
+            $ip,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+        ) === false;
+    }
+
+    /**
+     * Parse the final HTTP status code from a list of response header lines.
+     *
+     * @param list<string> $headers
+     */
+    private static function parseStatusCode(array $headers): int
+    {
+        $status = 0;
+        foreach ($headers as $header) {
+            if (preg_match('#^HTTP/\S+\s+(\d{3})#i', $header, $m) === 1) {
+                $status = (int) $m[1];
+            }
+        }
+        return $status;
+    }
+
+    /**
+     * Parse the last Content-Length header (in bytes) from a list of response header lines, or null
+     * when absent/unparseable.
+     *
+     * @param list<string> $headers
+     */
+    private static function parseContentLength(array $headers): ?int
+    {
+        $length = null;
+        foreach ($headers as $header) {
+            if (preg_match('#^Content-Length:\s*(\d+)\s*$#i', $header, $m) === 1) {
+                $length = (int) $m[1];
+            }
+        }
+        return $length;
+    }
+
+    /**
+     * Parse the last Location header from a list of response header lines.
+     *
+     * @param list<string> $headers
+     */
+    private static function parseLocationHeader(array $headers): ?string
+    {
+        $location = null;
+        foreach ($headers as $header) {
+            if (preg_match('#^Location:\s*(.+)$#i', $header, $m) === 1) {
+                $candidate = trim($m[1]);
+                if ($candidate !== '') {
+                    $location = $candidate;
+                }
+            }
+        }
+        return $location;
+    }
+
+    /**
+     * Resolve a redirect Location (absolute, root-relative, or path-relative) against the URL it
+     * was returned from, so the next hop can be re-validated.
+     */
+    private static function resolveRedirectTarget(string $base, string $location): string
+    {
+        if (preg_match('#^https?://#i', $location) === 1) {
+            return $location;
+        }
+
+        $parts = parse_url($base);
+        if (!is_array($parts) || !isset($parts['scheme'], $parts['host'])) {
+            return $location;
+        }
+
+        $origin = $parts['scheme'] . '://' . $parts['host']
+            . (isset($parts['port']) ? ':' . $parts['port'] : '');
+
+        if (str_starts_with($location, '/')) {
+            return $origin . $location;
+        }
+
+        $path = $parts['path'] ?? '/';
+        $dir = preg_replace('#/[^/]*$#', '/', $path) ?? '/';
+
+        return $origin . $dir . $location;
+    }
+
     public static function fromUpload(UploadedFileInterface $file, ?ApplicationContext $context = null): self
     {
-        $instance = app(self::resolveContext($context), self::class);
+        $instance = self::fresh(self::resolveContext($context));
 
         if ($file->getError() !== UPLOAD_ERR_OK) {
             throw BusinessLogicException::operationNotAllowed(
@@ -154,8 +483,14 @@ class ImageProcessor implements ImageProcessorInterface
             );
         }
 
-        // Validate file size
-        $instance->security->validateFileSize($file->getSize());
+        // Validate file size. PSR-7 getSize(): ?int may return null (size unknown — e.g. a
+        // non-seekable stream). When it does, SKIP the size cap rather than coerce null to 0: a
+        // 0-byte "size" would silently pass the cap and assert a falsehood about the upload. The
+        // decode-time dimension/integrity checks in validateImage() still bound the real payload.
+        $size = $file->getSize();
+        if ($size !== null) {
+            $instance->security->validateFileSize($size);
+        }
 
         // Validate format
         $filename = $file->getClientFilename() ?? 'upload';
@@ -181,7 +516,7 @@ class ImageProcessor implements ImageProcessorInterface
         string $background = 'ffffff',
         ?ApplicationContext $context = null
     ): self {
-        $instance = app(self::resolveContext($context), self::class);
+        $instance = self::fresh(self::resolveContext($context));
 
         // Validate dimensions
         $instance->security->validateDimensions($width, $height);
@@ -333,10 +668,15 @@ class ImageProcessor implements ImageProcessorInterface
             );
         }
 
+        // Confine the watermark source to a trusted base BEFORE the manager reads it: an
+        // unvalidated path (or stream-wrapper string) handed to decode() is an arbitrary-file-read
+        // primitive (e.g. /etc/passwd, php://filter, http://internal).
+        $resolvedWatermark = $this->resolveWatermarkPath($watermarkPath);
+
         $this->operations[] = ['watermark', compact('watermarkPath', 'position', 'opacity')];
 
         try {
-            $watermark = $this->manager->decode($watermarkPath);
+            $watermark = $this->manager->decode($resolvedWatermark);
 
             // Apply opacity
             if ($opacity < 100) {
@@ -384,10 +724,63 @@ class ImageProcessor implements ImageProcessorInterface
         }
     }
 
+    /**
+     * Read-or-populate the rendered image through the framework cache.
+     *
+     * On a cache HIT the stored payload (image bytes + format/dimension hints) is decoded back
+     * into {@see $image} and the just-decoded form is adopted as the current image — so a
+     * subsequent {@see getImageData()} returns the cached bytes WITHOUT re-running the encoder.
+     * On a MISS the current image is encoded once, stored (with the configured tags, when the
+     * backend supports tagging), and kept as-is.
+     *
+     * This replaces the former write-only behaviour where every "cached" pipeline re-encoded and
+     * filled a cache that nothing ever read.
+     *
+     * Caching is best-effort: any backend failure (get OR set) is logged and swallowed so the
+     * pipeline degrades to a normal in-memory render rather than throwing.
+     *
+     * CALLER NOTE on key collisions: an auto-generated key (see {@see generateCacheKey()}) hashes
+     * the queued operations, the current quality/format and the CURRENT dimensions — it does NOT
+     * fingerprint the source image bytes (doing so would force an extra encode). Two different
+     * source images that happen to share identical dimensions and the identical operation chain
+     * would therefore collide on an auto key. When that ambiguity matters, pass an EXPLICIT $key
+     * that identifies the source (e.g. the upload UUID or a content hash you already hold).
+     *
+     * @param string|null $key Explicit cache key, or null to derive one from the pipeline state.
+     *                         Explicit keys containing characters outside [A-Za-z0-9_.-] are
+     *                         hashed before use to neutralise backend delimiter-injection
+     *                         (Memcached spaces/newlines) and file-cache path-traversal.
+     * @param int $ttl Time to live in seconds.
+     */
     public function cached(?string $key = null, int $ttl = 3600): self
     {
-        $this->cacheKey = $key ?? $this->generateCacheKey();
+        $this->cacheKey = $key !== null ? $this->sanitizeCacheKey($key) : $this->generateCacheKey();
+        $fullCacheKey = ($this->config['cache']['prefix'] ?? 'image_') . $this->cacheKey;
 
+        // 1) Read: on a hit, adopt the cached bytes and skip re-encoding entirely.
+        try {
+            $cached = $this->cache->get($fullCacheKey);
+            if (is_array($cached) && isset($cached['image_data']) && is_string($cached['image_data'])) {
+                $this->image = $this->manager->decode($cached['image_data']);
+
+                $this->logger->debug('Image cache hit', [
+                    'cache_key' => $this->cacheKey,
+                    'size' => strlen($cached['image_data']),
+                ]);
+
+                return $this;
+            }
+        } catch (\Throwable $e) {
+            // A read failure must not abort the pipeline; fall through to a normal render.
+            $this->logger->warning('Cache read failed', [
+                'error' => $e->getMessage(),
+                'cache_key' => $this->cacheKey,
+            ]);
+
+            return $this;
+        }
+
+        // 2) Miss: encode once, persist (with tags when supported), keep the current image.
         try {
             $cacheData = [
                 'image_data' => $this->getImageData(),
@@ -398,9 +791,19 @@ class ImageProcessor implements ImageProcessorInterface
                 'created_at' => time()
             ];
 
-            $fullCacheKey = ($this->config['cache']['prefix'] ?? 'image_') . $this->cacheKey;
-
             $this->cache->set($fullCacheKey, $cacheData, $ttl);
+
+            // Associate the configured tags so the entries can be invalidated as a group. The
+            // CacheStore contract exposes addTags(); drivers that cannot tag (e.g. plain file)
+            // are expected to no-op rather than throw, but we guard anyway.
+            /** @var list<string> $tags */
+            $tags = array_values(array_filter(
+                (array) ($this->config['cache']['tags'] ?? []),
+                static fn($t): bool => is_string($t) && $t !== ''
+            ));
+            if ($tags !== []) {
+                $this->cache->addTags($fullCacheKey, $tags);
+            }
 
             $this->logger->debug('Image cached', [
                 'cache_key' => $this->cacheKey,
@@ -409,7 +812,7 @@ class ImageProcessor implements ImageProcessorInterface
             ]);
 
             return $this;
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             $this->logger->warning('Cache save failed', [
                 'error' => $e->getMessage(),
                 'cache_key' => $this->cacheKey
@@ -418,6 +821,23 @@ class ImageProcessor implements ImageProcessorInterface
             // Don't throw - caching is optional
             return $this;
         }
+    }
+
+    /**
+     * Neutralise a caller-supplied cache key. The key is concatenated raw onto the configured
+     * prefix and handed to the cache backend, so an unsanitised value is a backend delimiter
+     * injection (Memcached treats spaces/newlines as protocol delimiters) and a file-cache path
+     * traversal class. Any key containing a character outside the safe set [A-Za-z0-9_.-] is
+     * replaced wholesale with a short sha256 of the original (collision-resistant and confined to
+     * the safe alphabet). Already-safe keys are returned unchanged.
+     */
+    private function sanitizeCacheKey(string $key): string
+    {
+        if (preg_match('/^[A-Za-z0-9_.\-]+$/', $key) === 1) {
+            return $key;
+        }
+
+        return substr(hash('sha256', $key), 0, 32);
     }
 
     public function toBase64(?string $format = null): string
@@ -608,6 +1028,55 @@ class ImageProcessor implements ImageProcessorInterface
     }
 
     /**
+     * Resolve and confine a watermark source to a trusted local directory.
+     *
+     * The raw $watermarkPath reaches the image manager's decode(), which reads any path or PHP
+     * stream-wrapper string it is given — so an unconfined value is an arbitrary-file-read /SSRF
+     * primitive (`/etc/passwd`, `php://filter/...`, `http://169.254.169.254/...`). This rejects
+     * URLs and stream wrappers outright, then requires the canonical realpath() to exist AND sit
+     * inside the configured watermark base (paths.watermark_dir, defaulting to the system temp dir
+     * when unset). The returned path is the validated realpath.
+     *
+     * @throws BusinessLogicException If the path is a URL/stream wrapper, missing, or escapes the base.
+     */
+    private function resolveWatermarkPath(string $watermarkPath): string
+    {
+        // Reject any scheme-prefixed value (http://, https://, php://, file://, data://, ...). A bare
+        // local path has no "://" wrapper separator.
+        if (preg_match('#^[a-zA-Z][a-zA-Z0-9+.\-]*://#', $watermarkPath) === 1) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Watermark path must be a local file, not a URL or stream wrapper'
+            );
+        }
+
+        $baseConfigured = (string) ($this->config['paths']['watermark_dir'] ?? '');
+        $base = $baseConfigured !== '' ? $baseConfigured : sys_get_temp_dir();
+
+        $realBase = realpath($base);
+        $realPath = realpath($watermarkPath);
+
+        if ($realBase === false || $realPath === false) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Watermark file does not exist'
+            );
+        }
+
+        // Prefix-match with a trailing separator so "/base/watermarks" cannot be satisfied by a
+        // sibling like "/base/watermarks-evil/x.png".
+        $realBaseWithSep = rtrim($realBase, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        if (!str_starts_with($realPath . DIRECTORY_SEPARATOR, $realBaseWithSep)) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Watermark path is outside the allowed watermark directory'
+            );
+        }
+
+        return $realPath;
+    }
+
+    /**
      * @return array{x: int, y: int}
      */
     private function calculateWatermarkPosition(string $position, ImageInterface $watermark): array
@@ -622,14 +1091,25 @@ class ImageProcessor implements ImageProcessorInterface
             'top-right' => ['x' => $imageWidth - $watermarkWidth - 10, 'y' => 10],
             'bottom-left' => ['x' => 10, 'y' => $imageHeight - $watermarkHeight - 10],
             'bottom-right' => ['x' => $imageWidth - $watermarkWidth - 10, 'y' => $imageHeight - $watermarkHeight - 10],
+            // PHP's `/` always yields a float, so an odd width/height difference would hand a float
+            // to insert()'s `int $x`/`int $y` and throw a TypeError under strict_types. Round to the
+            // nearest whole pixel and cast back to int.
             'center' => [
-                'x' => ($imageWidth - $watermarkWidth) / 2,
-                'y' => ($imageHeight - $watermarkHeight) / 2
+                'x' => (int) round(($imageWidth - $watermarkWidth) / 2),
+                'y' => (int) round(($imageHeight - $watermarkHeight) / 2)
             ],
             default => ['x' => $imageWidth - $watermarkWidth - 10, 'y' => $imageHeight - $watermarkHeight - 10]
         };
     }
 
+    /**
+     * Derive a cache key from the pipeline's identifying state: the queued operations, the current
+     * quality/format and the current dimensions. NOTE: this deliberately does NOT hash the source
+     * image bytes (that would require an extra encode), so two distinct sources with identical
+     * dimensions + operations collide on this key — pass an explicit key to {@see cached()} when
+     * that matters (see that method's docblock). The output is hex-only and thus already inside the
+     * cache-safe alphabet, so it never needs sanitising.
+     */
     private function generateCacheKey(): string
     {
         $data = [
@@ -684,7 +1164,21 @@ class ImageProcessor implements ImageProcessorInterface
     }
 
     /**
-     * Get appropriate encoder for format and quality
+     * Build the Intervention encoder for a format, honouring the documented `formats.*` config.
+     *
+     * Wired through to the v4 encoder constructors (verified against intervention/image v4):
+     *  - JPEG: `formats.jpeg.progressive` (IMAGE_JPEG_PROGRESSIVE) -> JpegEncoder::$progressive,
+     *    which the GD encoder maps to imageinterlace().
+     *  - WebP: `formats.webp.lossless` (IMAGE_WEBP_LOSSLESS). The v4 WebpEncoder has NO `lossless`
+     *    constructor parameter; its GD encoder instead emits lossless WebP only when quality === 100
+     *    (it then substitutes IMG_WEBP_LOSSLESS). So lossless is requested by forcing quality to 100
+     *    — the single supported lossless path in this driver.
+     *
+     * NOT wireable in intervention/image v4 (documented here so the gap is explicit, not silently
+     * dropped): the PNG zlib compression level (config `optimization.png_compression` /
+     * `formats.png.compression`, env IMAGE_PNG_COMPRESSION) has no encoder constructor parameter —
+     * the v4 GD PngEncoder hardcodes imagepng(..., -1) (zlib default). The config key is therefore
+     * inert for PNG output until the upstream encoder grows a compression option.
      *
      * @param string $format Image format
      * @param int $quality Quality setting
@@ -692,11 +1186,20 @@ class ImageProcessor implements ImageProcessorInterface
      */
     private function getEncoder(string $format, int $quality): \Intervention\Image\Interfaces\EncoderInterface
     {
+        /** @var array<string, mixed> $formats */
+        $formats = (array) ($this->config['formats'] ?? []);
+
         return match (strtolower($format)) {
-            'jpg', 'jpeg' => new JpegEncoder(quality: $quality),
+            'jpg', 'jpeg' => new JpegEncoder(
+                quality: $quality,
+                progressive: (bool) (($formats['jpeg']['progressive'] ?? false)),
+            ),
             'png' => new PngEncoder(),
             'gif' => new GifEncoder(),
-            'webp' => new WebpEncoder(quality: $quality),
+            'webp' => new WebpEncoder(
+                // Lossless WebP in the v4 GD driver is keyed off quality === 100.
+                quality: (bool) (($formats['webp']['lossless'] ?? false)) ? 100 : $quality,
+            ),
             default => new AutoEncoder(quality: $quality)
         };
     }

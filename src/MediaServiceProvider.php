@@ -35,9 +35,13 @@ use Psr\Log\LoggerInterface;
 final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
 {
     /**
+     * Strongly-typed service definitions. Must be `defs()` (not the DSL `services()`):
+     * the framework's extension loader passes `defs()` entries through as DefinitionInterface
+     * objects, whereas `services()` is compiled by the DSL loader which only accepts array specs.
+     *
      * @return array<string, DefinitionInterface>
      */
-    public static function services(): array
+    public static function defs(): array
     {
         return [
             // Intervention ImageManager with driver selection.
@@ -75,6 +79,11 @@ final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
 
             // Image processor interface — resolves the CORE-owned
             // ImageSecurityValidator and `cache.store`/logger.
+            //
+            // NON-shared (third arg false): ImageProcessor carries mutable per-image state
+            // (image bytes, operations, cacheKey), so a shared instance would let two injection
+            // points processing different images stomp each other — the same hazard the static
+            // factories avoid via fresh(). Every resolution therefore returns a clean instance.
             ImageProcessorInterface::class => new FactoryDefinition(
                 ImageProcessorInterface::class,
                 static function (ContainerInterface $c): ImageProcessor {
@@ -90,6 +99,11 @@ final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
                         'defaults' => $getConfig('image.defaults'),
                         'performance' => $getConfig('image.performance'),
                         'monitoring' => $getConfig('image.monitoring'),
+                        // Per-format encoder settings (progressive JPEG, lossless WebP) read by
+                        // getEncoder(); must mirror fresh() so DI and factory paths agree.
+                        'formats' => $getConfig('image.formats'),
+                        // Watermark dir confinement parity with fresh().
+                        'paths' => $getConfig('image.paths'),
                     ];
 
                     return new ImageProcessor(
@@ -101,12 +115,12 @@ final class MediaServiceProvider extends \Glueful\Extensions\ServiceProvider
                         $config,
                     );
                 },
-                true,
+                false,
             ),
 
-            // Concrete id aliases the interface so ImageProcessor::make()'s
-            // app($context, ImageProcessor::class) and direct interface lookups
-            // resolve to the SAME shared instance.
+            // Concrete id aliases the interface. AliasDefinition is itself non-shared and
+            // delegates to the target, so resolving ImageProcessor::class yields a FRESH
+            // instance per call too (matching the non-shared interface binding above).
             ImageProcessor::class => new AliasDefinition(
                 ImageProcessor::class,
                 ImageProcessorInterface::class,

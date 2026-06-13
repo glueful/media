@@ -6,7 +6,9 @@ namespace Glueful\Extensions\Media\Tests\Integration;
 
 use Glueful\Bootstrap\ApplicationContext;
 use Glueful\Container\Container;
+use Glueful\Container\Definition\DefinitionInterface;
 use Glueful\Container\Definition\ValueDefinition;
+use Glueful\Container\Loader\DefaultServicesLoader;
 use Glueful\Extensions\Media\Contracts\ImageProcessorInterface;
 use Glueful\Extensions\Media\ImageProcessor;
 use Glueful\Extensions\Media\MediaProcessor;
@@ -26,7 +28,7 @@ use Psr\Log\NullLogger;
  * Harness: build the real framework Container seeded with the CORE-owned
  * collaborators the media factories depend on (ApplicationContext, cache.store,
  * LoggerInterface, ImageSecurityValidator), then load
- * MediaServiceProvider::services() AFTER. Container::load() overwrites by id,
+ * MediaServiceProvider::defs() AFTER. Container::load() overwrites by id,
  * mirroring provider-registration order.
  */
 final class MediaServiceProviderTest extends TestCase
@@ -60,7 +62,7 @@ final class MediaServiceProviderTest extends TestCase
         $context->setContainer($container);
 
         // Extension provider definitions applied AFTER core (last-provider-wins).
-        $container->load(MediaServiceProvider::services());
+        $container->load(MediaServiceProvider::defs());
 
         return $container;
     }
@@ -91,21 +93,30 @@ final class MediaServiceProviderTest extends TestCase
         );
     }
 
-    public function testImageProcessorInterfaceAndConcreteShareOneInstance(): void
+    public function testImageProcessorInterfaceResolvesFreshPerCall(): void
     {
         $context = $this->context();
         $container = $this->container($context, new ImageSecurityValidator([]));
 
-        $viaInterface = $container->get(ImageProcessorInterface::class);
+        $first = $container->get(ImageProcessorInterface::class);
+        $second = $container->get(ImageProcessorInterface::class);
         $viaConcrete = $container->get(ImageProcessor::class);
 
-        self::assertInstanceOf(ImageProcessor::class, $viaInterface);
-        // make() resolves the CONCRETE id (app($context, ImageProcessor::class));
-        // the alias must funnel it to the same shared interface instance.
-        self::assertSame(
-            $viaInterface,
+        self::assertInstanceOf(ImageProcessor::class, $first);
+        self::assertInstanceOf(ImageProcessor::class, $viaConcrete);
+
+        // The binding is NON-shared: ImageProcessor carries mutable per-image state, so a shared
+        // instance would let two consumers processing different images stomp each other. Every
+        // resolution — interface OR concrete-alias — must therefore be a distinct instance.
+        self::assertNotSame(
+            $first,
+            $second,
+            'ImageProcessorInterface must resolve a fresh instance per call (non-shared)'
+        );
+        self::assertNotSame(
+            $first,
             $viaConcrete,
-            'ImageProcessor alias + shared interface factory must yield one shared instance'
+            'The concrete alias must also resolve fresh (AliasDefinition delegates to a non-shared target)'
         );
     }
 
@@ -115,7 +126,7 @@ final class MediaServiceProviderTest extends TestCase
         // core (StorageProvider) owns it.
         self::assertArrayNotHasKey(
             ImageSecurityValidator::class,
-            MediaServiceProvider::services(),
+            MediaServiceProvider::defs(),
             'Provider must not re-bind ImageSecurityValidator — core owns it'
         );
 
@@ -129,6 +140,42 @@ final class MediaServiceProviderTest extends TestCase
             $container->get(ImageSecurityValidator::class),
             'Validator must remain the core-bound instance after the media provider loads'
         );
+    }
+
+    /**
+     * Discovery-path guard. Loads the provider the way the framework's extension discovery
+     * actually does (ContainerFactory::loadExtensionDefinitions): a `defs()` map passes through
+     * as DefinitionInterface objects, while a `services()` map is compiled by
+     * DefaultServicesLoader — which REJECTS non-array specs.
+     *
+     * The other tests use Container::load(), which accepts Definition objects directly, so they
+     * would NOT catch typed Definition objects mistakenly returned from `services()` (they belong
+     * in `defs()`). This test fails loudly on that regression — the loader throws
+     * "Service '<id>' must be an array".
+     */
+    public function testLoadsThroughExtensionDiscoveryDispatch(): void
+    {
+        $provider = MediaServiceProvider::class;
+
+        if (method_exists($provider, 'defs')) {
+            $defs = (array) $provider::defs();
+        } else {
+            $defs = (new DefaultServicesLoader())->load($provider::services(), $provider, false);
+        }
+
+        self::assertNotEmpty($defs);
+        self::assertArrayHasKey(
+            ImageProcessorInterface::class,
+            $defs,
+            'Provider must declare the ImageProcessorInterface binding'
+        );
+        foreach ($defs as $id => $def) {
+            self::assertInstanceOf(
+                DefinitionInterface::class,
+                $def,
+                "Definition for '{$id}' must be a DefinitionInterface after discovery-path loading"
+            );
+        }
     }
 
     public function testRegisterMergesImageConfig(): void

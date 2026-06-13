@@ -34,7 +34,7 @@ use Symfony\Component\HttpFoundation\Response;
  * SAME booted container exactly as the framework's extension-loading path would:
  *
  *   1. boot the Framework (core providers register, MediaProcessorInterface UNBOUND);
- *   2. $container->load(MediaServiceProvider::services()) — last-provider-wins, so
+ *   2. $container->load(MediaServiceProvider::defs()) — last-provider-wins, so
  *      the extension's MediaProcessor OVERRIDES the unbound core seam;
  *   3. new MediaServiceProvider($container)->register()  — merges image.* config;
  *   4. ->boot()  — seeds ImageProcessor::setContext() for the make() static path.
@@ -118,7 +118,7 @@ final class MediaInstalledTest extends TestCase
         // (2) Apply the extension provider's DI definitions into the SAME booted
         //     container — last-provider-wins overrides the unbound core seam, and
         //     binds the full image graph (ImageManager/ImageProcessor/interface).
-        $container->load(MediaServiceProvider::services());
+        $container->load(MediaServiceProvider::defs());
 
         // (3)+(4) Run the provider lifecycle exactly as the extension loader would:
         //     register() merges image.* config; boot() seeds the static context

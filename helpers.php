@@ -17,7 +17,8 @@ if (!function_exists('image')) {
         \Glueful\Bootstrap\ApplicationContext $context,
         string $source
     ): \Glueful\Extensions\Media\Contracts\ImageProcessorInterface {
-        $processor = app($context, \Glueful\Extensions\Media\Contracts\ImageProcessorInterface::class);
-        return $processor::make($source);
+        // make() builds a fresh processor from the container, so forward the EXPLICIT context
+        // rather than relying on the static default. No pre-resolution is needed.
+        return \Glueful\Extensions\Media\ImageProcessor::make($source, $context);
     }
 }

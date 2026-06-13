@@ -79,7 +79,13 @@ return [
     |
     */
     'security' => [
-        'allowed_domains' => explode(',', env('IMAGE_ALLOWED_DOMAINS', '*')), // '*' allows all
+        // Fail closed: remote image fetching is opt-in. Provide a comma-separated allow-list via
+        // IMAGE_ALLOWED_DOMAINS (and set IMAGE_DISABLE_EXTERNAL_URLS=false) to enable it. Empty
+        // by default, so no external host is permitted.
+        'allowed_domains' => array_values(array_filter(
+            array_map('trim', explode(',', (string) env('IMAGE_ALLOWED_DOMAINS', ''))),
+            static fn(string $d): bool => $d !== ''
+        )),
         'allowed_formats' => [
             'jpeg', 'jpg', 'png', 'gif', 'webp'
         ],
@@ -92,9 +98,13 @@ return [
         'validate_mime' => env('IMAGE_VALIDATE_MIME', true),
         'validate_extension' => env('IMAGE_VALIDATE_EXTENSION', true),
         'check_image_integrity' => env('IMAGE_CHECK_INTEGRITY', true),
-        'disable_external_urls' => env('IMAGE_DISABLE_EXTERNAL_URLS', false),
+        'disable_external_urls' => (bool) env('IMAGE_DISABLE_EXTERNAL_URLS', true),
         'user_agent' => env('IMAGE_USER_AGENT', 'Glueful-ImageProcessor/1.0'),
         'timeout' => (int) env('IMAGE_HTTP_TIMEOUT', 10), // HTTP timeout for remote images
+        // Hard cap on the byte length of a remotely fetched image body. The download read is capped
+        // at this size so a malicious/oversized response cannot be buffered before validation.
+        // Shorthand ('10M', '512K', '1G') or a raw byte count.
+        'max_file_size' => env('IMAGE_REMOTE_MAX_FILESIZE', '10M'),
     ],
 
     /*
@@ -215,5 +225,23 @@ return [
         'save_debug_images' => env('IMAGE_SAVE_DEBUG', false),
         'debug_output_dir' => env('IMAGE_DEBUG_DIR', $root . '/storage/debug/images'),
         'benchmark_operations' => env('IMAGE_BENCHMARK', false),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Media Metadata Extraction
+    |--------------------------------------------------------------------------
+    |
+    | Settings for video/audio metadata extraction via getID3. getID3 is a
+    | pure-PHP container parser with a history of parser vulnerabilities on
+    | malformed input, so uploads are size-capped before they are analysed.
+    |
+    | max_filesize is an ABUSE GUARD, not a typical-use limit: media files are
+    | legitimately large, so the default is generous. Files larger than this are
+    | not handed to the parser and degrade to type-only metadata.
+    |
+    */
+    'metadata' => [
+        'max_filesize' => env('MEDIA_METADATA_MAX_FILESIZE', '500M'),
     ],
 ];

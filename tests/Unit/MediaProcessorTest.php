@@ -134,13 +134,14 @@ final class MediaProcessorTest extends TestCase
         $security = new ImageSecurityValidator();
         $logger = new NullLogger();
 
+        // ImageProcessor::make() now builds a FRESH processor per call from the container's
+        // collaborators (ImageManager/cache.store/validator/logger) rather than resolving a
+        // pre-built shared ImageProcessor — so bind the collaborators, not the processor.
         $container = new Container([
-            ImageProcessor::class => static fn (): ImageProcessor => new ImageProcessor(
-                $manager,
-                $cache,
-                $security,
-                $logger
-            ),
+            ImageManager::class => static fn (): ImageManager => $manager,
+            'cache.store' => static fn (): CacheStore => $cache,
+            ImageSecurityValidator::class => static fn (): ImageSecurityValidator => $security,
+            \Psr\Log\LoggerInterface::class => static fn (): NullLogger => $logger,
         ]);
         $context->setContainer($container);
 

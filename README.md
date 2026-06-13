@@ -91,22 +91,59 @@ IMAGE_DRIVER=gd
 # Processing limits
 IMAGE_MAX_WIDTH=2048
 IMAGE_MAX_HEIGHT=2048
-IMAGE_MAX_FILESIZE=10M
+IMAGE_MAX_FILESIZE=10M             # max input file size for local processing
+# Reserved / NOT YET ENFORCED — present in config but no code applies them:
+IMAGE_MAX_MEMORY=256M              # reserved (no runtime memory cap is applied)
+IMAGE_PROCESSING_TIMEOUT=30       # reserved (no per-operation timeout is applied)
 
 # Quality
 IMAGE_JPEG_QUALITY=85
 IMAGE_WEBP_QUALITY=80
 
+# Per-format encoder settings
+IMAGE_JPEG_PROGRESSIVE=false      # functional: emits progressive JPEG when true
+IMAGE_WEBP_LOSSLESS=false         # functional: lossless WebP (encoded as quality 100)
+IMAGE_PNG_COMPRESSION=6           # INERT: Intervention v4's PNG encoder has no
+                                  #        compression parameter; kept for config parity
+
 # Security
-IMAGE_DISABLE_EXTERNAL_URLS=false
+IMAGE_DISABLE_EXTERNAL_URLS=true  # default true — remote fetching is OFF unless flipped
+IMAGE_ALLOWED_DOMAINS=            # empty default — comma-separated allow-list of hosts
 IMAGE_VALIDATE_MIME=true
+IMAGE_REMOTE_MAX_FILESIZE=10M     # hard cap on a remotely fetched image body
+
+# Metadata (getID3)
+MEDIA_METADATA_MAX_FILESIZE=500M  # abuse guard; larger files degrade to type-only metadata
 
 # Caching
 IMAGE_CACHE_ENABLED=true
 IMAGE_CACHE_TTL=86400
+
+# Paths
+IMAGE_WATERMARK_DIR=              # confinement base for watermark() sources (see Security)
 ```
 
 The framework's own upload keys — `UPLOADS_IMAGE_PROCESSING` / `UPLOADS_THUMBNAILS` / `THUMBNAIL_*` (in the app's `config/uploads.php` / `config/filesystem.php`) — gate the upload pipeline and take effect once this extension binds the seam.
+
+### Security behavior
+
+The extension fails closed and confines its filesystem and network reach:
+
+- **Remote fetching is opt-in.** `IMAGE_DISABLE_EXTERNAL_URLS` defaults to `true` and
+  `IMAGE_ALLOWED_DOMAINS` defaults to empty, so no external host is fetched unless you set
+  `IMAGE_DISABLE_EXTERNAL_URLS=false` and allow-list hosts.
+- **SSRF-hardened fetches.** Redirects are followed manually with **every hop re-validated**,
+  and each target host is rejected when it resolves to a private/loopback/link-local/reserved
+  IP. The download is **size-capped** by `IMAGE_REMOTE_MAX_FILESIZE` (default `10M`).
+- **Watermark sources are confined.** `watermark()` rejects URL/stream-wrapper paths and
+  requires the canonical path to sit inside `paths.watermark_dir` (`IMAGE_WATERMARK_DIR`,
+  falling back to the system temp dir when unset).
+- **getID3 is capped and contained.** Metadata extraction is size-capped by
+  `MEDIA_METADATA_MAX_FILESIZE` (default `500M`) and runs with parser warnings/throwables
+  contained; oversized or malformed files degrade to type-only metadata.
+- **Fresh processor instances.** Each factory call / container resolution yields a new
+  processor (the binding is non-shared). Persistent-worker users (RoadRunner/Swoole) get no
+  cross-request state bleed.
 
 ## Usage
 
@@ -160,7 +197,8 @@ The framework degrades gracefully when no media processor is bound:
 ## Requirements
 
 - PHP 8.3 or higher
-- Glueful 1.52.0 or higher
+- Glueful 1.55.0 or higher (the provider registers via the `defs()` typed-definition path
+  introduced in framework 1.55.0; on 1.52–1.54 it registers nothing)
 - GD or ImageMagick PHP extension (for image processing)
 - `intervention/image ^4.1` and `james-heinrich/getid3 ^1.9` (installed automatically)
 
