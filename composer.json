@@ -3,26 +3,43 @@
     "description": "Rich media processing for Glueful (image transforms, thumbnails, media metadata).",
     "type": "glueful-extension",
     "license": "MIT",
-    "authors": [{ "name": "Michael Tawiah Sowah", "email": "michael@glueful.dev" }],
-    "keywords": ["media", "image", "thumbnails", "metadata", "glueful"],
+    "authors": [
+        {
+            "name": "Michael Tawiah Sowah",
+            "email": "michael@glueful.dev"
+        }
+    ],
+    "keywords": [
+        "media",
+        "image",
+        "thumbnails",
+        "metadata",
+        "glueful"
+    ],
     "require": {
         "php": "^8.3",
         "intervention/image": "^4.1",
         "james-heinrich/getid3": "^1.9"
     },
     "require-dev": {
-        "glueful/framework": "^1.56.0",
+        "glueful/framework": "^1.79",
         "phpunit/phpunit": "^10.5",
         "squizlabs/php_codesniffer": "^3.6",
         "phpstan/phpstan": "^1.0"
     },
     "homepage": "https://github.com/glueful/media",
     "autoload": {
-        "psr-4": { "Glueful\\Extensions\\Media\\": "src/" },
-        "files": ["helpers.php"]
+        "psr-4": {
+            "Glueful\\Extensions\\Media\\": "src/"
+        },
+        "files": [
+            "helpers.php"
+        ]
     },
     "autoload-dev": {
-        "psr-4": { "Glueful\\Extensions\\Media\\Tests\\": "tests/" }
+        "psr-4": {
+            "Glueful\\Extensions\\Media\\Tests\\": "tests/"
+        }
     },
     "scripts": {
         "test": "vendor/bin/phpunit",
@@ -36,11 +53,20 @@
             "displayName": "Media",
             "description": "Rich media processing for Glueful.",
             "version": "1.1.0",
-            "categories": ["media", "images"],
+            "categories": [
+                "media",
+                "images"
+            ],
             "publisher": "glueful-team",
             "provider": "Glueful\\Extensions\\Media\\MediaServiceProvider",
-            "requires": { "glueful": ">=1.56.0", "extensions": [] }
+            "requires": {
+                "glueful": ">=1.79.0",
+                "extensions": []
+            },
+            "migrations": "none"
         }
     },
-    "config": { "sort-packages": true }
+    "config": {
+        "sort-packages": true
+    }
 }

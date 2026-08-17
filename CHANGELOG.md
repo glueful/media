@@ -6,6 +6,11 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+- Declares the schema-free Glueful manifest (migrations: none, requires.extensions); requires
+  framework >=1.79.0 for schema-on-enable participation.
+
+
 ## [1.1.0] - 2026-06-13
 
 ### Documentation
