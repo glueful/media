@@ -52,7 +52,7 @@
             "name": "Media",
             "displayName": "Media",
             "description": "Rich media processing for Glueful.",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "categories": [
                 "media",
                 "images"
