@@ -11,6 +11,7 @@ use Glueful\Container\Container;
 use Glueful\Extensions\Media\ImageProcessor;
 use Glueful\Extensions\Media\MediaMetadataExtractor;
 use Glueful\Extensions\Media\MediaProcessor;
+use Glueful\Http\Exceptions\Domain\BusinessLogicException;
 use Glueful\Services\ImageSecurityValidator;
 use Glueful\Uploader\MediaMetadata;
 use Glueful\Uploader\Storage\StorageInterface;
@@ -30,6 +31,7 @@ use Psr\Log\NullLogger;
 final class MediaProcessorTest extends TestCase
 {
     private string $fixture;
+    private ApplicationContext $context;
 
     protected function setUp(): void
     {
@@ -75,6 +77,58 @@ final class MediaProcessorTest extends TestCase
         self::assertNotFalse($info);
         // contain resize maintains aspect ratio; width clamps to ~50px.
         self::assertSame(50, $info[0]);
+    }
+
+    public function testRenderVariantResizesASourceLargerThanTheOutputLimit(): void
+    {
+        $large = $this->makeFixture(2731, 2048);
+
+        try {
+            $result = $this->makeProcessor()->renderVariant($large, ['width' => 400, 'height' => 400]);
+        } finally {
+            @unlink($large);
+        }
+
+        $info = getimagesizefromstring($result['data']);
+        self::assertIsArray($info);
+        self::assertSame(400, $info[0]);
+        self::assertSame(300, $info[1]);
+    }
+
+    public function testRenderVariantWithNoTargetSizeKeepsTheOutputLimit(): void
+    {
+        $large = $this->makeFixture(2731, 2048);
+
+        try {
+            $this->expectException(BusinessLogicException::class);
+            $this->makeProcessor()->renderVariant($large, ['format' => 'webp']);
+        } finally {
+            @unlink($large);
+        }
+    }
+
+    public function testForResizeRefusesASourceOverThePixelLimit(): void
+    {
+        $this->makeProcessor();
+
+        $this->expectException(BusinessLogicException::class);
+        $this->expectExceptionMessage('memory limit protection');
+
+        ImageProcessor::forResize($this->fixture, 100, $this->context);
+    }
+
+    public function testForResizeRefusesAFileThatIsNotAnImage(): void
+    {
+        $this->makeProcessor();
+        $path = (string) tempnam(sys_get_temp_dir(), 'notimage');
+        file_put_contents($path, '<script>alert(1)</script>');
+
+        try {
+            $this->expectException(BusinessLogicException::class);
+            ImageProcessor::forResize($path, 25000000, $this->context);
+        } finally {
+            @unlink($path);
+        }
     }
 
     public function testRenderVariantHonoursFormatOption(): void
@@ -124,6 +178,30 @@ final class MediaProcessorTest extends TestCase
         self::assertSame('https://cdn.example.test/' . $writtenPath, $url);
     }
 
+    public function testGenerateThumbnailFromASourceLargerThanTheOutputLimit(): void
+    {
+        $large = $this->makeFixture(2731, 2048);
+        $storage = new SpyStorage('https://cdn.example.test/');
+
+        try {
+            $url = $this->makeProcessor()->generateThumbnail(
+                $storage,
+                $large,
+                'uploads/2026',
+                'photo.jpg',
+                ['width' => 32, 'height' => 32]
+            );
+        } finally {
+            @unlink($large);
+        }
+
+        self::assertIsString($url);
+        $info = getimagesizefromstring((string) reset($storage->writes));
+        self::assertIsArray($info);
+        self::assertSame(32, $info[0]);
+        self::assertSame(32, $info[1]);
+    }
+
     private function makeProcessor(): MediaProcessor
     {
         $context = new ApplicationContext(basePath: sys_get_temp_dir(), environment: 'testing');
@@ -144,6 +222,7 @@ final class MediaProcessorTest extends TestCase
             \Psr\Log\LoggerInterface::class => static fn (): NullLogger => $logger,
         ]);
         $context->setContainer($container);
+        $this->context = $context;
 
         return new MediaProcessor(new MediaMetadataExtractor(), $context);
     }

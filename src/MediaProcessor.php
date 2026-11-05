@@ -62,8 +62,6 @@ final class MediaProcessor implements MediaProcessorInterface
      */
     public function renderVariant(string $sourcePath, array $options): array
     {
-        $processor = ImageProcessor::make($sourcePath, $this->context);
-
         $maxWidth = (int) $this->getConfig('uploads.image_processing.max_width', 2048);
         $maxHeight = (int) $this->getConfig('uploads.image_processing.max_height', 2048);
 
@@ -76,6 +74,15 @@ final class MediaProcessor implements MediaProcessorInterface
         if ($height !== null && $height > $maxHeight) {
             $height = $maxHeight;
         }
+
+        // With no target size the variant keeps the source's, so the source must fit the limits.
+        $processor = $width === null && $height === null
+            ? ImageProcessor::make($sourcePath, $this->context)
+            : ImageProcessor::forResize(
+                $sourcePath,
+                (int) $this->getConfig('uploads.image_processing.max_pixels', 25000000),
+                $this->context,
+            );
 
         $fit = isset($options['fit']) ? (string) $options['fit'] : 'contain';
         if ($fit === 'cover' && $width !== null && $height !== null) {

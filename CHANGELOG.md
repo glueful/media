@@ -6,6 +6,19 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-05
+
+### Fixed
+- **`renderVariant()` resizes sources larger than the image limits.** A source over
+  `image.limits.max_width` or `max_height` (2048px by default) was refused while loading, even for a
+  small thumbnail. A new `ImageProcessor::forResize()` applies the limits to the size requested and
+  holds the source to `uploads.image_processing.max_pixels` (25MP by default), read from the file's
+  header before decoding. With no target size, `renderVariant()` keeps the old check. Thumbnails
+  from a large private image also need glueful/framework 1.91.7.
+- **Upload thumbnails are made from sources larger than the image limits.** `ThumbnailGenerator`
+  loaded the source the same way, so a large upload failed quietly and got no thumbnail. It now uses
+  `ImageProcessor::forResize()`; the thumbnail size is still checked against the limits.
+
 ## [1.2.0] - 2026-08-17
 
 ### Added
