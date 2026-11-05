@@ -133,6 +133,44 @@ class ImageProcessor implements ImageProcessorInterface
     }
 
     /**
+     * Load a local image that is about to be resized.
+     *
+     * make() holds a source to the output limits, which would refuse a large original even
+     * for a small thumbnail. Here the size requested is what the limits apply to, as resize()
+     * and fit() already check, so the source only has to be small enough to decode safely.
+     * The pixel count comes from the file's header, before any decoding.
+     *
+     * @param int $maxPixels Largest source to decode, in total pixels; 0 for no limit
+     */
+    public static function forResize(string $path, int $maxPixels, ?ApplicationContext $context = null): self
+    {
+        $size = is_file($path) ? @getimagesize($path) : false;
+        if ($size === false) {
+            throw BusinessLogicException::operationNotAllowed('image_processing', 'Invalid image file');
+        }
+        if ($maxPixels > 0 && $size[0] * $size[1] > $maxPixels) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Image dimensions too large (memory limit protection)'
+            );
+        }
+
+        $instance = self::fresh(self::resolveContext($context));
+
+        try {
+            $instance->decodeSource($path);
+            $instance->validateImage(false);
+
+            return $instance;
+        } catch (\Exception $e) {
+            throw BusinessLogicException::operationNotAllowed(
+                'image_processing',
+                'Failed to load image: ' . $e->getMessage()
+            );
+        }
+    }
+
+    /**
      * Decode a make() source into the working image. http(s) URLs are routed through the SAME
      * hardened fetch as fromUrl() so make() (and the image() helper) cannot be tricked into the
      * resolve-at-validate, fetch-at-decode DNS-rebinding TOCTOU that handing the URL string to
@@ -1004,7 +1042,7 @@ class ImageProcessor implements ImageProcessorInterface
      * Private Helper Methods
      */
 
-    private function validateImage(): void
+    private function validateImage(bool $enforceOutputLimits = true): void
     {
         if (!isset($this->image)) {
             throw BusinessLogicException::operationNotAllowed(
@@ -1014,7 +1052,9 @@ class ImageProcessor implements ImageProcessorInterface
         }
 
         // Validate dimensions
-        $this->security->validateDimensions($this->image->width(), $this->image->height());
+        if ($enforceOutputLimits) {
+            $this->security->validateDimensions($this->image->width(), $this->image->height());
+        }
 
         // Additional integrity checks
         if (($this->config['security']['check_image_integrity'] ?? true) === true) {

@@ -114,7 +114,11 @@ final class ThumbnailGenerator
      */
     private function createThumbnail(string $sourcePath, int $width, int $height, int $quality): string
     {
-        $processor = ImageProcessor::make($sourcePath, $this->context);
+        $processor = ImageProcessor::forResize(
+            $sourcePath,
+            (int) $this->getConfig('uploads.image_processing.max_pixels', 25000000),
+            $this->context,
+        );
 
         return $processor
             ->fit($width, $height)
